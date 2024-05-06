@@ -16,6 +16,8 @@ from utils import CTCLabelConverter, CTCLabelConverterForBaiduWarpctc, AttnLabel
 from dataset import hierarchical_dataset, AlignCollate, Batch_Balanced_Dataset
 from model import Model
 from test import validation
+from calibration.calibrators import LOSS_FUNC, LOSS_FUNC_CTC
+from calibration.metrics import ACE, ECE
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -30,7 +32,7 @@ def train(opt):
     opt.batch_ratio = opt.batch_ratio.split('-')
     train_dataset = Batch_Balanced_Dataset(opt)
 
-    log = open(f'./saved_models/{opt.exp_name}/log_dataset.txt', 'a')
+    log = open(f'./saved_models/{opt.exp_name}/{opt.calibrator}/{opt.beta}/log_dataset.txt', 'a')
     AlignCollate_valid = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
     valid_dataset, valid_dataset_log = hierarchical_dataset(root=opt.valid_data, opt=opt)
     valid_loader = torch.utils.data.DataLoader(
@@ -89,15 +91,11 @@ def train(opt):
 
     """ setup loss """
     if 'CTC' in opt.Prediction:
-        if opt.baiduCTC:
-            # need to install warpctc. see our guideline.
-            from warpctc_pytorch import CTCLoss 
-            criterion = CTCLoss()
-        else:
-            criterion = torch.nn.CTCLoss(zero_infinity=True).to(device)
+        criterion = LOSS_FUNC_CTC[opt.calibrator](opt=opt).to(device)
+        criterion_val = torch.nn.CTCLoss(zero_infinity=True).to(device)
     else:
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)  # ignore [GO] token = ignore index 0
-    # loss averager
+        criterion = LOSS_FUNC[opt.calibrator](ignore_index=0, opt=opt).to(device) 
+        criterion_val = torch.nn.CrossEntropyLoss(ignore_index=0).to(device)
     loss_avg = Averager()
 
     # filter that only require gradient decent
@@ -118,8 +116,7 @@ def train(opt):
     print(optimizer)
 
     """ final options """
-    # print(opt)
-    with open(f'./saved_models/{opt.exp_name}/opt.txt', 'a') as opt_file:
+    with open(f'./saved_models/{opt.exp_name}/{opt.calibrator}/{opt.beta}/opt.txt', 'a') as opt_file:
         opt_log = '------------ Options -------------\n'
         args = vars(opt)
         for k, v in args.items():
@@ -136,10 +133,10 @@ def train(opt):
             print(f'continue to train, start_iter: {start_iter}')
         except:
             pass
-
+    
     start_time = time.time()
     best_accuracy = -1
-    best_norm_ED = -1
+    best_ece = float('inf')
     iteration = start_iter
 
     while(True):
@@ -152,17 +149,12 @@ def train(opt):
         if 'CTC' in opt.Prediction:
             preds = model(image, text)
             preds_size = torch.IntTensor([preds.size(1)] * batch_size)
-            if opt.baiduCTC:
-                preds = preds.permute(1, 0, 2)  # to use CTCLoss format
-                cost = criterion(preds, text, preds_size, length) / batch_size
-            else:
-                preds = preds.log_softmax(2).permute(1, 0, 2)
-                cost = criterion(preds, text, preds_size, length)
-
+            # preds = preds.log_softmax(2).permute(1, 0, 2)
+            cost = criterion(preds, text, preds_size, length, labels)
         else:
-            preds = model(image, text[:, :-1])  # align with Attention.forward
-            target = text[:, 1:]  # without [GO] Symbol
-            cost = criterion(preds.view(-1, preds.shape[-1]), target.contiguous().view(-1))
+            preds = model(image, text[:, :-1]) 
+            target = text[:, 1:] 
+            cost = criterion(preds, target.contiguous(), length, labels)
 
         model.zero_grad()
         cost.backward()
@@ -175,50 +167,43 @@ def train(opt):
         if (iteration + 1) % opt.valInterval == 0 or iteration == 0: # To see training progress, we also conduct validation when 'iteration == 0' 
             elapsed_time = time.time() - start_time
             # for log
-            with open(f'./saved_models/{opt.exp_name}/log_train.txt', 'a') as log:
+            with open(f'./saved_models/{opt.exp_name}/{opt.calibrator}/{opt.beta}/log_train.txt', 'a') as log:
                 model.eval()
                 with torch.no_grad():
-                    valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data = validation(
-                        model, criterion, valid_loader, converter, opt)
+                    valid_loss, current_accuracy, current_norm_ED, preds, confidence_score, labels, infer_time, length_of_data, preds_data = validation(
+                        model, criterion_val, valid_loader, converter, opt)
                 model.train()
+                current_ece, acc, _, pzhECE, flag_str = ACE(preds_data, bin_num=15)
+                ece, mce = ECE(preds_data, bin_num=15)
 
-                # training loss and validation loss
-                loss_log = f'[{iteration+1}/{opt.num_iter}] Train loss: {loss_avg.val():0.5f}, Valid loss: {valid_loss:0.5f}, Elapsed_time: {elapsed_time:0.5f}'
-                loss_avg.reset()
-
-                current_model_log = f'{"Current_accuracy":17s}: {current_accuracy:0.3f}, {"Current_norm_ED":17s}: {current_norm_ED:0.2f}'
-
-                # keep best accuracy model (on valid dataset)
                 if current_accuracy > best_accuracy:
                     best_accuracy = current_accuracy
-                    torch.save(model.state_dict(), f'./saved_models/{opt.exp_name}/best_accuracy.pth')
-                if current_norm_ED > best_norm_ED:
-                    best_norm_ED = current_norm_ED
-                    torch.save(model.state_dict(), f'./saved_models/{opt.exp_name}/best_norm_ED.pth')
-                best_model_log = f'{"Best_accuracy":17s}: {best_accuracy:0.3f}, {"Best_norm_ED":17s}: {best_norm_ED:0.2f}'
+                    torch.save(model.state_dict(), f'./saved_models/{opt.exp_name}/{opt.calibrator}/{opt.beta}/T_{iteration}_ece_{current_ece:0.5f}_acc_{current_accuracy:0.5f}_pce_{pzhECE:0.5f}.pth')                                        
+                if best_ece > current_ece:
+                    best_ece = current_ece
+                    if current_ece < 0.015:
+                        torch.save(model.state_dict(), f'./saved_models/{opt.exp_name}/{opt.calibrator}/{opt.beta}/{iteration}_acc_{current_accuracy:0.5f}_ece{ece:0.5f}_ace_{current_ece:0.5f}_mce_{mce:0.5f}.pth')
 
+                dashed_line = '-' * 80
+                loss_log = f'[{iteration+1}/{opt.num_iter}] Train loss: {loss_avg.val():0.5f}, Valid loss: {valid_loss:0.5f}, beta: {opt.beta:0.5f}, calibrator: {opt.calibrator:17s}'
+                loss_avg.reset()
+                current_model_log = f'{"Current_accuracy":17s}: {current_accuracy:0.3f}, {"current_ece":17s}: {current_ece:0.5f}, {"pzhECE":17s}: {pzhECE:0.5f}'
+                best_model_log = f'{"Best_accuracy":17s}: {best_accuracy:0.3f}, {"best_ece":17s}: {best_ece:0.5f}'
                 loss_model_log = f'{loss_log}\n{current_model_log}\n{best_model_log}'
                 print(loss_model_log)
-                log.write(loss_model_log + '\n')
+                log.write(loss_model_log + '\n' + '\n')
+                log.write(flag_str[1] + '\n')
 
-                # show some predicted results
-                dashed_line = '-' * 80
                 head = f'{"Ground Truth":25s} | {"Prediction":25s} | Confidence Score & T/F'
                 predicted_result_log = f'{dashed_line}\n{head}\n{dashed_line}\n'
-                for gt, pred, confidence in zip(labels[:5], preds[:5], confidence_score[:5]):
+                for gt, pred, confidence in zip(labels[:3], preds[:3], confidence_score[:3]):
                     if 'Attn' in opt.Prediction:
                         gt = gt[:gt.find('[s]')]
                         pred = pred[:pred.find('[s]')]
-
                     predicted_result_log += f'{gt:25s} | {pred:25s} | {confidence:0.4f}\t{str(pred == gt)}\n'
                 predicted_result_log += f'{dashed_line}'
-                print(predicted_result_log)
+                print(predicted_result_log + '\n')
                 log.write(predicted_result_log + '\n')
-
-        # save model per 1e+5 iter.
-        if (iteration + 1) % 1e+5 == 0:
-            torch.save(
-                model.state_dict(), f'./saved_models/{opt.exp_name}/iter_{iteration+1}.pth')
 
         if (iteration + 1) == opt.num_iter:
             print('end the training')
@@ -235,7 +220,7 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
     parser.add_argument('--batch_size', type=int, default=192, help='input batch size')
     parser.add_argument('--num_iter', type=int, default=300000, help='number of iterations to train for')
-    parser.add_argument('--valInterval', type=int, default=2000, help='Interval between each validation')
+    parser.add_argument('--valInterval', type=int, default=200, help='Interval between each validation')
     parser.add_argument('--saved_model', default='', help="path to model to continue training")
     parser.add_argument('--FT', action='store_true', help='whether to do fine-tuning')
     parser.add_argument('--adam', action='store_true', help='Whether to use adam (default is Adadelta)')
@@ -256,8 +241,8 @@ if __name__ == '__main__':
     parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
     parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
     parser.add_argument('--rgb', action='store_true', help='use rgb input')
-    parser.add_argument('--character', type=str,
-                        default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
+    # parser.add_argument('--character', type=str,
+    #                     default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
     parser.add_argument('--sensitive', action='store_true', help='for sensitive character mode')
     parser.add_argument('--PAD', action='store_true', help='whether to keep ratio then pad for image resize')
     parser.add_argument('--data_filtering_off', action='store_true', help='for data_filtering_off mode')
@@ -273,7 +258,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_channel', type=int, default=512,
                         help='the number of output channel of Feature extractor')
     parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
-
+    parser.add_argument('--calibrator', type=str, default='ce')
+    parser.add_argument('--beta', type=float, default=0.0)
     opt = parser.parse_args()
 
     if not opt.exp_name:
@@ -281,12 +267,15 @@ if __name__ == '__main__':
         opt.exp_name += f'-Seed{opt.manualSeed}'
         # print(opt.exp_name)
 
-    os.makedirs(f'./saved_models/{opt.exp_name}', exist_ok=True)
+    os.makedirs(f'./saved_models/{opt.exp_name}/{opt.calibrator}/{opt.beta}', exist_ok=True)
 
     """ vocab / character number configuration """
     if opt.sensitive:
-        # opt.character += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        opt.character = string.printable[:-6]  # same with ASTER setting (use 94 char).
+        with open('data_lmdb_release/charset_94.txt','r') as f:
+            opt.character = "".join(sorted(f.read()))
+    else:
+        with open('data_lmdb_release/charset_36.txt','r') as f:
+            opt.character = "".join(sorted(f.read()))
 
     """ Seed and GPU setting """
     # print("Random Seed: ", opt.manualSeed)

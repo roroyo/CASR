@@ -13,7 +13,7 @@ class CTCLabelConverter(object):
         for i, char in enumerate(dict_character):
             # NOTE: 0 is reserved for 'CTCblank' token required by CTCLoss
             self.dict[char] = i + 1
-
+        self.idict = dict(map(reversed, self.dict.items()))
         self.character = ['[CTCblank]'] + dict_character  # dummy '[CTCblank]' token for CTCLoss (index 0)
 
     def encode(self, text, batch_max_length=25):

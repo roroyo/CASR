@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import string
@@ -10,6 +11,8 @@ import torch.utils.data
 import torch.nn.functional as F
 import numpy as np
 from nltk.metrics.distance import edit_distance
+from calibration.metrics import ACE, ECE
+from tools.ctc_utils import ctc_prefix_beam_search
 
 from utils import CTCLabelConverter, AttnLabelConverter, Averager
 from dataset import hierarchical_dataset, AlignCollate
@@ -40,6 +43,7 @@ def benchmark_all_eval(model, criterion, converter, opt, calculate_infer_time=Fa
     dashed_line = '-' * 80
     print(dashed_line)
     log.write(dashed_line + '\n')
+    preds_datas=[]
     for eval_data in eval_data_list:
         eval_data_path = os.path.join(opt.eval_data, eval_data)
         AlignCollate_evaluation = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
@@ -50,8 +54,9 @@ def benchmark_all_eval(model, criterion, converter, opt, calculate_infer_time=Fa
             num_workers=int(opt.workers),
             collate_fn=AlignCollate_evaluation, pin_memory=True)
 
-        _, accuracy_by_best_model, norm_ED_by_best_model, _, _, _, infer_time, length_of_data = validation(
+        _, accuracy_by_best_model, norm_ED_by_best_model, _, _, _, infer_time, length_of_data, preds_data = validation(
             model, criterion, evaluation_loader, converter, opt)
+        preds_datas += preds_data
         list_accuracy.append(f'{accuracy_by_best_model:0.3f}')
         total_forward_time += infer_time
         total_evaluation_data_number += len(eval_data)
@@ -75,7 +80,7 @@ def benchmark_all_eval(model, criterion, converter, opt, calculate_infer_time=Fa
     log.write(evaluation_log + '\n')
     log.close()
 
-    return None
+    return preds_datas
 
 
 def validation(model, criterion, evaluation_loader, converter, opt):
@@ -85,7 +90,7 @@ def validation(model, criterion, evaluation_loader, converter, opt):
     length_of_data = 0
     infer_time = 0
     valid_loss_avg = Averager()
-
+    preds_data = []
     for i, (image_tensors, labels) in enumerate(evaluation_loader):
         batch_size = image_tensors.size(0)
         length_of_data = length_of_data + batch_size
@@ -137,14 +142,24 @@ def validation(model, criterion, evaluation_loader, converter, opt):
         preds_prob = F.softmax(preds, dim=2)
         preds_max_prob, _ = preds_prob.max(dim=2)
         confidence_score_list = []
-        for gt, pred, pred_max_prob in zip(labels, preds_str, preds_max_prob):
+        for gt, pred, pred_max_prob, logit  in zip(labels, preds_str, preds_max_prob, preds):
             if 'Attn' in opt.Prediction:
                 gt = gt[:gt.find('[s]')]
                 pred_EOS = pred.find('[s]')
                 pred = pred[:pred_EOS]  # prune after "end of sentence" token ([s])
                 pred_max_prob = pred_max_prob[:pred_EOS]
+                try:
+                    confidence_score = pred_max_prob.cumprod(dim=0)[-1].item()
+                except:
+                    confidence_score = 0
+                token_confs = pred_max_prob.tolist()
 
-            # To evaluate 'case sensitive model' with alphanumeric and case insensitve setting.
+            if 'CTC' in opt.Prediction:
+                hyps, confidence_score = ctc_prefix_beam_search(logit.unsqueeze(0), beam_size=1)
+                confidence_score = confidence_score[0]
+                pred = "".join([converter.idict[i] for i in hyps[0][0]])
+                token_confs = []
+
             if opt.sensitive and opt.data_filtering_off:
                 pred = pred.lower()
                 gt = gt.lower()
@@ -173,18 +188,13 @@ def validation(model, criterion, evaluation_loader, converter, opt):
             else:
                 norm_ED += 1 - edit_distance(pred, gt) / len(pred)
 
-            # calculate confidence score (= multiply of pred_max_prob)
-            try:
-                confidence_score = pred_max_prob.cumprod(dim=0)[-1]
-            except:
-                confidence_score = 0  # for empty pred case, when prune after "end of sentence" token ([s])
             confidence_score_list.append(confidence_score)
-            # print(pred, gt, pred==gt, confidence_score)
+            preds_data.append([confidence_score, token_confs, pred, gt])
 
     accuracy = n_correct / float(length_of_data) * 100
     norm_ED = norm_ED / float(length_of_data)  # ICDAR2019 Normalized Edit Distance
 
-    return valid_loss_avg.val(), accuracy, norm_ED, preds_str, confidence_score_list, labels, infer_time, length_of_data
+    return valid_loss_avg.val(), accuracy, norm_ED, preds_str, confidence_score_list, labels, infer_time, length_of_data, preds_data
 
 
 def test(opt):
@@ -223,7 +233,7 @@ def test(opt):
     model.eval()
     with torch.no_grad():
         if opt.benchmark_all_eval:  # evaluation with 10 benchmark evaluation datasets
-            benchmark_all_eval(model, criterion, converter, opt)
+            preds_data = benchmark_all_eval(model, criterion, converter, opt)
         else:
             log = open(f'./result/{opt.exp_name}/log_evaluation.txt', 'a')
             AlignCollate_evaluation = AlignCollate(imgH=opt.imgH, imgW=opt.imgW, keep_ratio_with_pad=opt.PAD)
@@ -233,12 +243,17 @@ def test(opt):
                 shuffle=False,
                 num_workers=int(opt.workers),
                 collate_fn=AlignCollate_evaluation, pin_memory=True)
-            _, accuracy_by_best_model, _, _, _, _, _, _ = validation(
-                model, criterion, evaluation_loader, converter, opt)
+            _, accuracy_by_best_model, _, _, _, _, _, _, preds_data = validation(model, criterion, evaluation_loader, converter, opt)         
             log.write(eval_data_log)
-            print(f'{accuracy_by_best_model:0.3f}')
             log.write(f'{accuracy_by_best_model:0.3f}\n')
             log.close()
+
+        current_ece, acc, _, _, _ = ACE(preds_data, bin_num=15)
+        ece, mce = ECE(preds_data, bin_num=15)
+        print(f'ACC: {100 * acc:6.2f}, ECE: {100 * ece:6.2f}, ACE: {100 * current_ece:6.2f}, MCE: {100 * mce:6.2f},')
+
+        with open(opt.json_path,'w') as f: 
+            f.write(json.dumps(preds_data, ensure_ascii=False))   
 
 
 if __name__ == '__main__':
@@ -253,7 +268,7 @@ if __name__ == '__main__':
     parser.add_argument('--imgH', type=int, default=32, help='the height of the input image')
     parser.add_argument('--imgW', type=int, default=100, help='the width of the input image')
     parser.add_argument('--rgb', action='store_true', help='use rgb input')
-    parser.add_argument('--character', type=str, default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
+    # parser.add_argument('--character', type=str, default='0123456789abcdefghijklmnopqrstuvwxyz', help='character label')
     parser.add_argument('--sensitive', action='store_true', help='for sensitive character mode')
     parser.add_argument('--PAD', action='store_true', help='whether to keep ratio then pad for image resize')
     parser.add_argument('--data_filtering_off', action='store_true', help='for data_filtering_off mode')
@@ -268,13 +283,17 @@ if __name__ == '__main__':
     parser.add_argument('--output_channel', type=int, default=512,
                         help='the number of output channel of Feature extractor')
     parser.add_argument('--hidden_size', type=int, default=256, help='the size of the LSTM hidden state')
-
+    parser.add_argument('--json_path', type=str, required=True)
     opt = parser.parse_args()
 
     """ vocab / character number configuration """
     if opt.sensitive:
-        opt.character = string.printable[:-6]  # same with ASTER setting (use 94 char).
-
+        with open('data_lmdb_release/charset_94.txt','r') as f:
+            opt.character = "".join(sorted(f.read()))
+    else:
+        with open('data_lmdb_release/charset_36.txt','r') as f:
+            opt.character = "".join(sorted(f.read()))
+    
     cudnn.benchmark = True
     cudnn.deterministic = True
     opt.num_gpu = torch.cuda.device_count()
